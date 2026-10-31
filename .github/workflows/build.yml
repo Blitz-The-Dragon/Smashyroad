@@ -1,0 +1,132 @@
+name: Build Verdant APK
+
+# Builds the open-source Flipper Android app (MIT) with branding removed
+# and a green theme, then commits a signed APK back to this branch.
+on:
+  push:
+    branches: [verdant-build]
+    paths-ignore: ["out/**"]
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App name shown on the home screen"
+        default: "Verdant"
+      upstream_ref:
+        description: "Upstream branch or tag to build"
+        default: "1.8.1.1890"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: verdant-build
+  cancel-in-progress: true
+
+env:
+  APP_NAME: ${{ inputs.app_name || 'Verdant' }}
+  UPSTREAM_REF: ${{ inputs.upstream_ref || '1.8.1.1890' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules || true
+
+      - name: Checkout this branch (debrand script)
+        uses: actions/checkout@v4
+        with:
+          path: kit
+
+      - name: Checkout upstream app source
+        uses: actions/checkout@v4
+        with:
+          repository: flipperdevices/Flipper-Android-App
+          ref: ${{ env.UPSTREAM_REF }}
+          path: app
+          submodules: recursive
+
+      - name: Debrand and apply green theme
+        working-directory: app
+        run: python3 ../kit/debrand.py
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Fit Gradle into the runner's memory
+        run: |
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx6g -XX:+UseParallelGC -Dfile.encoding=UTF-8
+          kotlin.compiler.execution.strategy=in-process
+          EOF
+
+      - name: Build APK (no Google services, no analytics)
+        working-directory: app
+        env:
+          ORG_GRADLE_PROJECT_is_google_feature: "false"
+          ORG_GRADLE_PROJECT_is_metric_enabled: "false"
+          ORG_GRADLE_PROJECT_is_sentry_publish: "false"
+          ORG_GRADLE_PROJECT_source_install: "github"
+          ORG_GRADLE_PROJECT_current_flavor_type: "PROD"
+          ORG_GRADLE_PROJECT_version_name: "1.0.${{ github.run_number }}"
+          ORG_GRADLE_PROJECT_version_code: "${{ github.run_number }}"
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew :instances:android:app:assembleInternal --no-configuration-cache --stacktrace 2>&1 | tee ../build.log
+
+      - name: Sign APK
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.jks
+            PASS="$KEYSTORE_PASSWORD"
+          else
+            PASS=throwaway-pass
+            keytool -genkeypair -keystore release.jks -storepass "$PASS" -keypass "$PASS" \
+              -alias app -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Verdant"
+          fi
+          ls -la app/instances/android/app/build/outputs/apk/internal/
+          IN=$(ls app/instances/android/app/build/outputs/apk/internal/*.apk | head -1)
+          "$BT/zipalign" -p -f 4 "$IN" aligned.apk
+          "$BT/apksigner" sign --ks release.jks --ks-pass "pass:$PASS" --ks-key-alias app \
+            --out verdant.apk aligned.apk
+          "$BT/apksigner" verify --print-certs verdant.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verdant-apk
+          path: verdant.apk
+
+      - name: Commit APK back to this branch
+        working-directory: kit
+        run: |
+          mkdir -p out
+          cp ../verdant.apk out/verdant.apk
+          echo "run ${{ github.run_number }} | upstream ${{ env.UPSTREAM_REF }} | $(date -u)" > out/BUILD_INFO.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add out
+          git commit -m "Add built APK (run ${{ github.run_number }}) [skip ci]"
+          git push
+
+      - name: Save build log on failure
+        if: failure()
+        working-directory: kit
+        run: |
+          mkdir -p out
+          echo "FAILED run ${{ github.run_number }}" > out/BUILD_FAILED.txt
+          [ -f ../build.log ] && grep -n -E "^e: |error:|FAILURE|What went wrong" -A6 ../build.log | head -200 >> out/BUILD_FAILED.txt
+          [ -f ../build.log ] && tail -150 ../build.log >> out/BUILD_FAILED.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add out && git commit -m "Build failed (run ${{ github.run_number }}) [skip ci]" && git push || true
