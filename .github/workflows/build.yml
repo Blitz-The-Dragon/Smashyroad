@@ -79,7 +79,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./gradlew :instances:android:app:assembleInternal --no-configuration-cache --stacktrace 2>&1 | tee ../build.log
+          ./gradlew :instances:android:app:assembleInternal --stacktrace 2>&1 | tee ../build.log
 
       - name: Sign APK
         env:
